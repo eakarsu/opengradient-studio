@@ -1,0 +1,7 @@
+Developers use it to:
+
+- **Host models:** upload and manage AI models in its Model Hub.
+- **Run AI:** send prompts or data and receive answers or predictions.
+- **Build agents and workflows:** connect AI to applications, including blockchain applications. [Official SDK documentation](<https://docs.opengradient.ai/developers/sdk/>)
+
+Its main focus is **verifiable and private AI computing**, using protected hardware and cryptographic proofs to support execution checks and confidentiality. [Network overview](<https://www.opengradient.ai/opengradient-network>)
