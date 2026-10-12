@@ -53,6 +53,7 @@ export function createWorkflowEngine({ database = pool, execution, blockchain } 
     }
   }
   async function run(id, input, trigger = 'manual', options = {}) {
+    options.signal?.throwIfAborted();
     requireId(id);
     if (stopping) throw problem(503, 'The app is stopping. Try this workflow after restart.');
     if (running.has(id)) throw problem(409, 'This workflow already has a run in progress.');
@@ -91,6 +92,7 @@ export function createWorkflowEngine({ database = pool, execution, blockchain } 
         if (step.kind === 'contract') {
           const observation = await blockchain.read(step, signal);
           result = `## Blockchain observation\n\nNetwork: ${observation.network_name}\n\nContract: ${observation.address}\n\nFunction: ${observation.method}\n\nBlock: ${observation.block_number}\n\n` + observation.values.map(value => `**${value.name}:** ${Array.isArray(value.value) ? value.value.join(', ') : value.value}`).join('\n\n');
+          signal.throwIfAborted();
           await database.query('INSERT INTO chain_observations(id,network,address,method,result,block_number) VALUES($1,$2,$3,$4,$5,$6)', [randomUUID(), observation.network, observation.address, observation.method, observation, observation.block_number]);
         } else {
           const prompt = step.prompt.replace(/\{\{(input|previous|step:([a-z0-9_-]+))\}\}/g, (match, variable, key) => variable === 'input' ? source : variable === 'previous' ? previous : outputs[key] ?? match);
@@ -99,10 +101,12 @@ export function createWorkflowEngine({ database = pool, execution, blockchain } 
           const response = await execution.execute({ model_id, ...(step.kind === 'agent' ? { agent_id: step.agent_id } : {}), input: prompt, name: `${workflow.name} · ${step.name}` }, { signal });
           result = response.inference.output; inference_id = response.inference.id;
         }
+        signal.throwIfAborted();
         previous = result; outputs[step.id] = result;
         completed.push({ id: step.id, name: step.name, kind: step.kind, status: 'Completed', output: result, inference_id, latency_ms: Math.round(performance.now() - started) });
         await database.query('UPDATE workflow_runs SET steps=$1,output=$2 WHERE id=$3', [JSON.stringify(completed), result, runId]);
       }
+      signal.throwIfAborted();
       const record = (await database.query("UPDATE workflow_runs SET status='Completed',completed_at=NOW() WHERE id=$1 RETURNING *", [runId])).rows[0];
       await database.query('UPDATE workflows SET last_run_at=NOW() WHERE id=$1', [id]);
       return record;

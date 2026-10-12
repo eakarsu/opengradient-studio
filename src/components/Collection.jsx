@@ -25,6 +25,9 @@ export default function Collection({ entity, refresh, onOpen, onCreate, onRun, o
     setLoading(true); setError('');
     const params = new URLSearchParams({ page, pageSize, q: query, status, category, sort: sort.key, order: sort.order });
     api(`/${entity}?${params}`, { signal: controller.signal }).then(result => {
+      if (!Array.isArray(result?.rows) || !Number.isInteger(result.total) || !Number.isInteger(result.pages)) {
+        throw new Error(`The ${config.title.toLowerCase()} list returned an invalid page. Refresh the app and try again.`);
+      }
       if (result.pages && page > result.pages) setPage(result.pages);
       else setData(result);
     }).catch(error => { if (error.name !== 'AbortError') setError(error.message); }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
@@ -39,7 +42,9 @@ export default function Collection({ entity, refresh, onOpen, onCreate, onRun, o
       let currentPage = 1, pages = 1;
       do {
         const params = new URLSearchParams({ page: currentPage, pageSize: 100, q: query, status, category, sort: sort.key, order: sort.order });
-        const result = await api(`/${entity}?${params}`); all.push(...result.rows); pages = result.pages; currentPage++;
+        const result = await api(`/${entity}?${params}`);
+        if (!Array.isArray(result?.rows) || !Number.isInteger(result.pages)) throw new Error('The record export returned an invalid page.');
+        all.push(...result.rows); pages = result.pages; currentPage++;
       } while (currentPage <= pages);
       const fields = config.fields;
       const csvEscape = value => {

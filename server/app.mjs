@@ -115,8 +115,8 @@ app.get('/api/overview', async (req, res) => {
       LEFT JOIN inferences i ON i.created_at >= day AND i.created_at < day + INTERVAL '1 day'
       GROUP BY day ORDER BY day`, [days]),
     pool.query(`SELECT region, COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status='Online')::int AS online FROM nodes GROUP BY region ORDER BY total DESC`),
-    pool.query('SELECT * FROM inferences ORDER BY created_at DESC,id LIMIT 5'),
-    pool.query("SELECT m.*, (SELECT COUNT(*)::int FROM inferences i WHERE i.model_id=m.id) AS inference_count FROM models m WHERE status='Published' ORDER BY created_at ASC,id LIMIT 3"),
+    pool.query('SELECT * FROM inferences ORDER BY created_at DESC,id LIMIT 15'),
+    pool.query("SELECT m.*, (SELECT COUNT(*)::int FROM inferences i WHERE i.model_id=m.id) AS inference_count FROM models m WHERE status='Published' ORDER BY created_at ASC,id LIMIT 15"),
     pool.query('SELECT * FROM activity ORDER BY created_at DESC,id DESC LIMIT 6'),
   ]);
   res.json({

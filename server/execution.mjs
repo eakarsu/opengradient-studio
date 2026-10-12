@@ -50,6 +50,7 @@ export function createExecutionEngine({ database = pool, transact = transaction,
   }
 
   async function execute(input, { signal } = {}) {
+    signal?.throwIfAborted();
     const modelId = requireId(input.model_id);
     const prompt = typeof input.input === 'string' ? input.input.trim() : '';
     if (!prompt || prompt.length > 20000) throw problem(422, 'Provide an input between 1 and 20,000 characters.');
@@ -72,6 +73,7 @@ export function createExecutionEngine({ database = pool, transact = transaction,
     const temperature = input.temperature ?? agent?.temperature ?? 0.3;
     if (typeof temperature !== 'number' || !Number.isFinite(temperature) || temperature < 0 || temperature > 1) throw problem(422, 'Creativity must be between zero and one.');
     const name = String(input.name || `${agent?.name || model.name} · execution`).slice(0, 255);
+    signal?.throwIfAborted();
     const runId = randomUUID();
     await database.query("INSERT INTO inferences(id,name,model_id,agent_id,status,verification,input,provider) VALUES($1,$2,$3,$4,'Queued','Local hash',$5,$6)", [runId, name, modelId, agent?.id || null, prompt, model.provider]);
     const started = performance.now();
@@ -102,19 +104,23 @@ export function createExecutionEngine({ database = pool, transact = transaction,
       if (typeof result.output !== 'string' || result.output.length > 120000) throw problem(502, 'The model returned an unusable response.');
       const duration = Math.round(performance.now() - started);
       return await transact(async client => {
+        signal?.throwIfAborted();
         const inference = (await client.query("UPDATE inferences SET status='Completed',output=$1,latency_ms=$2,tokens=$3,cost=$4,provider_metadata=$5,updated_at=NOW(),revision=revision+1 WHERE id=$6 RETURNING *", [result.output, duration, Number.isInteger(result.tokens) ? result.tokens : 0, result.cost, result.metadata, runId])).rows[0];
+        signal?.throwIfAborted();
         const payload = receiptPayload(inference);
         const proof = (await client.query("INSERT INTO proofs(id,name,inference_id,scheme,status,digest,payload,description) VALUES($1,$2,$3,'SHA-256','Valid',$4,$5,$6) RETURNING *", [randomUUID(), `Integrity · ${name}`.slice(0, 255), runId, digestPayload(payload), payload, 'SHA-256 receipt of the saved input and result. Provider proof material is retained separately on the inference.'])).rows[0];
+        signal?.throwIfAborted();
         await client.query("INSERT INTO activity(entity,record_id,record_name,action,detail) VALUES('inferences',$1,$2,'executed',$3)", [runId, name, `Executed using ${model.provider}.`]);
         if (agent && agent.memory_enabled !== false) {
           for (const [role, content] of [['user', prompt], ['assistant', result.output]]) await client.query('INSERT INTO agent_memory(id,agent_id,inference_id,role,content) VALUES($1,$2,$3,$4,$5)', [randomUUID(), agent.id, runId, role, content]);
         }
+        signal?.throwIfAborted();
         return { inference, proof, outputs: result.metadata.outputs || null };
       });
     } catch (error) {
-      const message = error.status ? error.message : 'Model execution failed. Check the connection and inputs, then try again.';
+      const message = signal?.aborted ? 'Request cancelled.' : error.status ? error.message : 'Model execution failed. Check the connection and inputs, then try again.';
       await database.query("UPDATE inferences SET status='Failed',error=$1,latency_ms=$2,updated_at=NOW(),revision=revision+1 WHERE id=$3", [message, Math.round(performance.now() - started), runId]);
-      throw error.status ? error : problem(502, message);
+      throw signal?.aborted ? problem(499, message) : error.status ? error : problem(502, message);
     }
   }
   return { execute, complete };

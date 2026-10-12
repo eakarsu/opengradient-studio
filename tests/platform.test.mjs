@@ -240,6 +240,51 @@ test('overlapping runs are rejected and failed workflows retain completed steps 
   assert.equal(failed.status, 'Failed'); assert.equal(failed.steps[0].status, 'Completed'); assert.match(failed.error, /rate limited/);
 });
 
+test('canceling a manual workflow aborts the provider, preserves a failed attempt, and releases its lock', async () => {
+  const marker = 'Cancelled workflow ' + randomUUID();
+  const workflow = await request('/workflows', 'POST', workflowBody([aiStep('first'), aiStep('second')]), 201);
+  const controller = new AbortController(), beforeCalls = providerCalls.length;
+  providerMode = 'slow';
+  const pending = fetch(`${endpoint}/workflows/${workflow.id}/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ input: marker }), signal: controller.signal });
+  pending.catch(() => {});
+  try {
+    for (let i = 0; providerCalls.length === beforeCalls && i < 100; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(providerCalls.length, beforeCalls + 1, 'the first provider step must have started');
+    controller.abort(); await assert.rejects(pending, error => error.name === 'AbortError');
+    let saved;
+    for (let i = 0; i < 100; i++) {
+      saved = (await request(`/workflows/${workflow.id}/runs`))[0];
+      if (saved?.status === 'Failed') break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(saved.status, 'Failed'); assert.match(saved.error, /cancel/i); assert.deepEqual(saved.steps, []);
+    assert.equal(providerCalls.length, beforeCalls + 1, 'a canceled workflow must not call the second step');
+    await new Promise(resolve => setTimeout(resolve, 180));
+    const attempts = (await pool.query('SELECT id,status,output,error FROM inferences WHERE input LIKE $1', ['%' + marker + '%'])).rows;
+    assert.equal(attempts.length, 1, 'retain the genuine execution attempt');
+    assert.equal(attempts[0].status, 'Failed'); assert.ok(!attempts[0].output); assert.match(attempts[0].error, /cancel/i);
+    assert.equal((await pool.query('SELECT id FROM proofs WHERE inference_id=$1', [attempts[0].id])).rowCount, 0, 'a canceled attempt must not have a success receipt');
+    providerMode = 'ok';
+    assert.equal((await request(`/workflows/${workflow.id}/run`, 'POST', { input: 'A fresh run after cancellation' }, 201)).status, 'Completed');
+  } finally { controller.abort(); providerMode = 'ok'; }
+});
+
+test('cancellation after an actual result UPDATE rolls back output and receipts while retaining the failed attempt', async () => {
+  const { createExecutionEngine } = await import('../server/execution.mjs');
+  const controller = new AbortController(), marker = 'Persistence cancellation ' + randomUUID(); let intercepted = false;
+  const engine = createExecutionEngine({ database: pool, bridge, connections, settingsStore: { read: async () => ({ apiKey: fakeKey, model: 'test/model' }) }, fetchImpl: (_url, options) => fetch(`http://127.0.0.1:${upstream.address().port}/chat`, options), transact: callback => transact(client => callback({ query: async (...args) => {
+    const result = await client.query(...args);
+    if (args[0].startsWith("UPDATE inferences SET status='Completed'")) { intercepted = true; controller.abort(); }
+    return result;
+  } })) });
+  await assert.rejects(engine.execute({ model_id: hosted.id, input: marker, name: marker }, { signal: controller.signal }), error => error.status === 499);
+  assert.equal(intercepted, true, 'exercise the real PostgreSQL mutation before cancellation');
+  const row = (await pool.query('SELECT id,status,output,error FROM inferences WHERE input=$1', [marker])).rows[0];
+  assert.equal(row.status, 'Failed'); assert.ok(!row.output); assert.match(row.error, /cancel/i);
+  assert.equal((await pool.query('SELECT id FROM proofs WHERE inference_id=$1', [row.id])).rowCount, 0);
+  assert.equal((await pool.query("SELECT id FROM activity WHERE record_id=$1 AND action='executed'", [row.id])).rowCount, 0);
+});
+
 test('contract reads are ABI-decoded at the recorded block and cannot send a transaction', async () => {
   const status = await request('/networks/base');
   assert.equal(status.connected, true); assert.equal(status.status, 'connected');

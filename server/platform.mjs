@@ -167,7 +167,12 @@ export function createPlatform({ database = pool, transact = transaction, storag
     const row = (await database.query('UPDATE workflows SET name=$1,description=$2,status=$3,trigger_type=$4,interval_minutes=$5,default_input=$6,steps=$7,next_run_at=CASE WHEN $4=\'schedule\' AND $3=\'Active\' THEN NOW()+make_interval(mins => $5::int) ELSE NULL END,updated_at=NOW(),revision=revision+1 WHERE id=$8 AND revision=$9 RETURNING id,name,revision', [values.name, values.description, values.status, values.trigger_type, values.interval_minutes, values.default_input, JSON.stringify(values.steps), req.params.id, req.body.revision])).rows[0];
     if (!row) throw problem(409, 'This workflow changed. Reload it before saving.'); res.json(row);
   });
-  router.post('/workflows/:id/run', async (req, res) => res.status(201).json(await workflows.run(req.params.id, req.body?.input)));
+  router.post('/workflows/:id/run', async (req, res) => {
+    const controller = new AbortController(); const disconnected = () => { if (!res.writableEnded) controller.abort(); }; res.once('close', disconnected);
+    try { const report = await workflows.run(req.params.id, req.body?.input, 'manual', { signal: controller.signal }); if (!controller.signal.aborted) res.status(201).json(report); }
+    catch (error) { if (!controller.signal.aborted) throw error; }
+    finally { res.removeListener('close', disconnected); }
+  });
   router.get('/workflows/:id/runs', async (req, res) => { requireId(req.params.id); res.json((await database.query('SELECT * FROM workflow_runs WHERE workflow_id=$1 ORDER BY started_at DESC LIMIT 30', [req.params.id])).rows); });
   router.post('/workflows/:id/token', async (req, res) => {
     requireId(req.params.id); const token = randomBytes(32).toString('hex');

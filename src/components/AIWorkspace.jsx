@@ -3,7 +3,8 @@ import { aiFeatures, aiFeatureMap, aiDefaults, aiExampleSets, presetValues } fro
 import { entities, entityOrder } from '../../shared/entities.mjs';
 import { api, date, number } from '../api';
 import { Icon, Loading } from './ui';
-import AIResponse, { readableResponse } from './AIResponse';
+import { readableResponse } from './AIResponse';
+import JsonReport from './JsonReport';
 
 export function AIFeatureStrip({ entity, onAI }) {
   return <section className="ai-feature-strip" aria-label={`${entities[entity].title} AI tools`}><div className="ai-strip-heading"><span className="ai-icon small"><Icon name="Sparkles" size={17}/></span><div><strong>AI for {entities[entity].title.toLowerCase()}</strong><span>Full forms. Ready-to-use examples. Useful answers.</span></div><span className="ai-powered-label">OpenRouter</span></div><div className="ai-strip-tools">{aiFeatures.filter(feature => feature.entity === entity).map(feature => <button key={feature.id} onClick={() => onAI({ featureId: feature.id })}><Icon name={feature.icon} size={17}/><div><strong>{feature.title}</strong><span>{feature.description}</span></div><Icon name="ArrowUpRight" size={15}/></button>)}</div></section>;
@@ -27,7 +28,7 @@ export default function AIWorkspace({ selected, onSelect, drafts, setDrafts, set
   const currentDraft = drafts[feature.id] || { values: aiDefaults(feature, settings?.default_model) };
   function updateDraft(draft) { setDrafts(current => ({ ...current, [feature.id]: draft })); }
   function fillAll(index) {
-    setDrafts(Object.fromEntries(aiFeatures.map(tool => [tool.id, { values: presetValues(tool, index, settings?.default_model), preset: tool.presets[index].id }])));
+    setDrafts(current => ({ ...current, ...Object.fromEntries(aiFeatures.map(tool => [tool.id, { ...current[tool.id], values: presetValues(tool, index, settings?.default_model), preset: tool.presets[index].id }])) }));
     notify(`Filled every field in all ${aiFeatures.length} AI tools. Choose a tool to generate its response.`);
   }
   return <div className="ai-workspace">
@@ -52,9 +53,10 @@ function AIWorkbench({ feature, draft, onDraft, settings, models, catalogUnavail
   const [historyRefresh, setHistoryRefresh] = useState(0);
   const [opening, setOpening] = useState(false);
   const request = useRef(null);
+  const historyRequest = useRef(null);
   const report = useRef(null);
   const answerPanel = useRef(null);
-  useEffect(() => () => request.current?.abort(), []);
+  useEffect(() => () => { request.current?.abort(); request.current = null; historyRequest.current?.abort(); historyRequest.current = null; }, []);
   useEffect(() => {
     if (result && window.matchMedia('(max-width:960px)').matches) answerPanel.current?.scrollIntoView({ block: 'start', behavior: window.matchMedia('(prefers-reduced-motion:reduce)').matches ? 'auto' : 'smooth' });
   }, [result]);
@@ -69,25 +71,33 @@ function AIWorkbench({ feature, draft, onDraft, settings, models, catalogUnavail
   }, [initialRunId]);
   function update(key, value) { onDraft({ ...draft, preset: null, values: { ...values, [key]: value } }); setErrors(current => ({ ...current, [key]: '' })); }
   function fillPreset(index) {
-    onDraft({ values: presetValues(feature, index, settings?.default_model), preset: feature.presets[index].id });
+    onDraft({ ...draft, values: presetValues(feature, index, settings?.default_model), preset: feature.presets[index].id });
     setError(''); setErrors({});
     notify(`${feature.presets[index].label}: every field is filled in.`);
   }
   async function generate(event) {
     event.preventDefault(); setError(''); setErrors({});
     if (!settings?.configured) { setError('Connect OpenRouter in AI settings, then generate your response.'); onSettings(); return; }
+    historyRequest.current?.abort(); historyRequest.current = null; setOpening(false);
     const controller = new AbortController(); request.current = controller; setBusy(true);
     try {
       const response = await api('/ai/generate', { method: 'POST', signal: controller.signal, body: { feature_id: feature.id, values, source_record_id: draft.sourceRecordId || null } });
+      if (controller.signal.aborted || request.current !== controller) return;
       setResult(response); setHistoryPage(1); setHistoryRefresh(value => value + 1); notify('Your AI response is ready and saved to PostgreSQL.');
-    } catch (error) { if (error.name !== 'AbortError') { setError(error.message); setErrors(error.fields || {}); } }
+    } catch (error) { if (!controller.signal.aborted && request.current === controller && error.name !== 'AbortError') { setError(error.message); setErrors(error.fields || {}); } }
     finally { if (request.current === controller) { setBusy(false); request.current = null; } }
   }
+  function cancelRequest() {
+    const controller = request.current; request.current = null; controller?.abort(); setBusy(false);
+    notify('AI request canceled. Your brief is still available.');
+  }
   async function openReport(id) {
+    request.current?.abort(); request.current = null; setBusy(false);
+    historyRequest.current?.abort(); const controller = new AbortController(); historyRequest.current = controller;
     setOpening(true); setError('');
-    try { const response = await api(`/ai/runs/${id}`); setResult(response); }
-    catch (error) { setError(error.message); }
-    finally { setOpening(false); }
+    try { const response = await api(`/ai/runs/${id}`, { signal: controller.signal }); if (!controller.signal.aborted && historyRequest.current === controller) setResult(response); }
+    catch (error) { if (!controller.signal.aborted && historyRequest.current === controller) setError(error.message); }
+    finally { if (historyRequest.current === controller) { historyRequest.current = null; setOpening(false); } }
   }
   async function copy() {
     try { await navigator.clipboard.writeText(readableResponse(result.response)); notify('AI response copied.'); }
@@ -112,7 +122,7 @@ function AIWorkbench({ feature, draft, onDraft, settings, models, catalogUnavail
           {errors[field.key] && <small className="ai-field-error">{errors[field.key]}</small>}
         </label>)}</div></fieldset>
         {error && <div className="ai-error" role="alert"><Icon name="CircleAlert" size={17}/><span>{error}</span></div>}
-        <div className="ai-generate-row"><span><Icon name="LockKeyhole" size={13}/>Sent to OpenRouter when you generate</span>{busy ? <button type="button" className="button secondary" onClick={() => request.current?.abort()}>Cancel request</button> : <button type="submit" className="button primary"><Icon name="Sparkles" size={17}/>Generate with AI<Icon name="ArrowRight" size={15}/></button>}</div></form>
+        <div className="ai-generate-row"><span><Icon name="LockKeyhole" size={13}/>Sent to OpenRouter when you generate</span>{busy ? <button type="button" className="button secondary" onClick={cancelRequest}>Cancel request</button> : <button type="submit" className="button primary"><Icon name="Sparkles" size={17}/>Generate with AI<Icon name="ArrowRight" size={15}/></button>}</div></form>
       </section>
       <section ref={answerPanel} className="ai-answer-panel" aria-label="AI response" aria-busy={busy || opening}>
         <header className="ai-panel-heading"><span className="ai-icon small green"><Icon name="Sparkles" size={20}/></span><div><span className="ai-step">02 / YOUR RESPONSE</span><h2>{busy ? 'Creating your response' : result ? 'Ready for your next step' : 'A clearer way forward'}</h2></div>{result && !busy && <span className="ai-saved-badge"><Icon name="CircleCheck" size={12}/>Saved</span>}</header>
@@ -120,7 +130,7 @@ function AIWorkbench({ feature, draft, onDraft, settings, models, catalogUnavail
           <div className="ai-result-meta"><div><span>OPENROUTER RESPONSE</span><h3>{result.title}</h3></div><div className="ai-response-actions"><button aria-label="Copy AI response" title="Copy response" onClick={copy}><Icon name="Copy" size={16}/></button><button aria-label="Download formatted report" title="Download formatted report" onClick={exportReport}><Icon name="Download" size={16}/></button></div></div>
           <div className="ai-result-stats"><span><Icon name="Box" size={13}/>{models.find(model => model.id === result.model)?.name || result.model}</span><span>{(result.latency_ms / 1000).toFixed(1)}s</span><span>{number(result.total_tokens)} tokens</span>{result.cost_usd !== null && <span>${Number(result.cost_usd).toFixed(5)}</span>}</div>
           {result.truncated && <div className="ai-truncated"><Icon name="Info" size={15}/>The model reached your response token limit. Increase the limit and generate again for a longer answer.</div>}
-          <div ref={report} className="ai-report-body"><AIResponse content={result.response}/></div><div className="ai-result-footer"><Icon name="Database" size={13}/>Saved {date(result.created_at)}<button onClick={() => { onDraft({ values: result.request }); notify('All request fields restored from this response.'); }}>Reuse this brief<Icon name="ArrowUpRight" size={13}/></button></div>
+          <div ref={report} className="ai-report-body"><JsonReport raw={result.response} title={result.title || feature.title} model={result.model} tokens={result.total_tokens}/></div><div className="ai-result-footer"><Icon name="Database" size={13}/>Saved {date(result.created_at)}<button onClick={() => { onDraft({ ...draft, values: result.request }); notify('All request fields restored from this response.'); }}>Reuse this brief<Icon name="ArrowUpRight" size={13}/></button></div>
         </> : <div className="ai-answer-empty"><div className="ai-empty-illustration"><span/><span/><span/><Icon name="Sparkles" size={34}/></div><span className="ai-empty-kicker">GOOD ANSWERS START WITH A GOOD BRIEF</span><h3>Your ideas, thoughtfully developed.</h3><p>Choose a complete example, make it yours, and generate a response with clear findings, helpful tables, and practical next steps.</p><div className="ai-answer-benefits"><span><Icon name="List" size={14}/>Readable reports</span><span><Icon name="Database" size={14}/>Saved history</span><span><Icon name="Download" size={14}/>Ready to share</span></div>{!settings?.configured && <button className="button secondary" onClick={onSettings}><Icon name="LockKeyhole" size={15}/>Connect OpenRouter</button>}</div>}
       </section>
     </div>
