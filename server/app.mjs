@@ -7,6 +7,8 @@ import { entities, entityOrder, defaultsFor } from '../shared/entities.mjs';
 import { insertRow } from './seed.mjs';
 import { receiptPayload, digestPayload, sandboxInference } from './receipts.mjs';
 import { createAiRouter } from './ai.mjs';
+import { recordsToCsv, recordsToJson } from '../shared/export.mjs';
+import { fallbackModelHealth, fallbackInferenceHealth, fallbackAgentReadiness, callProvider, hasProvider } from '../shared/ai-fallback.mjs';
 import { platform } from './platform.mjs';
 
 const app = express();
@@ -231,6 +233,66 @@ app.get('/api/:entity', async (req, res) => {
   const total = (await pool.query(`SELECT COUNT(*)::int AS count FROM "${entity}" ${where}`, params)).rows[0].count;
   const { rows } = await pool.query(`SELECT * FROM "${entity}" ${where} ORDER BY "${sort}" ${order.toUpperCase()},id ASC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, [...params, pageSize, (page - 1) * pageSize]);
   res.json({ rows: await hydrate(pool, entity, rows), total, page, pageSize, pages: Math.ceil(total / pageSize) });
+});
+
+app.get('/api/tasks', async (req, res) => {
+  const status = typeof req.query.status === 'string' ? req.query.status : '';
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const params = [];
+  const clauses = [];
+  if (status) { params.push(status); clauses.push(`status=$${params.length}`); }
+  if (q) { params.push(`%${q}%`); clauses.push(`name ILIKE $${params.length}`); }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const { rows } = await pool.query(`SELECT * FROM workspace_tasks ${where} ORDER BY created_at DESC LIMIT 200`, params);
+  res.json({ tasks: rows });
+});
+app.post('/api/tasks', async (req, res) => {
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  if (!name) fail(400, 'Task title is required.');
+  const { rows } = await pool.query(
+    'INSERT INTO workspace_tasks(id,name,owner,status,priority,description) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+    [randomUUID(), name, req.body.owner || 'workspace', req.body.status || 'Open', req.body.priority || 'Normal', req.body.description || '']
+  );
+  res.status(201).json({ task: rows[0] });
+});
+app.patch('/api/tasks/:id', async (req, res) => {
+  requireId(req.params.id);
+  const existing = (await pool.query('SELECT * FROM workspace_tasks WHERE id=$1', [req.params.id])).rows[0];
+  if (!existing) fail(404, 'Task not found.');
+  const fields = [];
+  const params = [];
+  for (const key of ['name', 'owner', 'status', 'priority', 'description']) {
+    if (key in (req.body || {})) { params.push(req.body[key]); fields.push(`"${key}"=$${params.length}`); }
+  }
+  if (!fields.length) fail(400, 'No changes provided.');
+  params.push(req.params.id);
+  const { rows } = await pool.query(`UPDATE workspace_tasks SET ${fields.join(',')},updated_at=NOW(),revision=revision+1 WHERE id=$${params.length} RETURNING *`, params);
+  res.json({ task: rows[0] });
+});
+
+// AI fallback over own records: provider only when a key is configured, otherwise deterministic (aiGenerated:false).
+// The existing /api/ai/generate contract (503 when unconfigured) is unchanged.
+async function featureAi(entity, fallbackFn, feature, label) {
+  const { rows } = await pool.query(`SELECT * FROM "${entity}" ORDER BY created_at DESC LIMIT 200`);
+  if (!hasProvider()) return fallbackFn(rows);
+  return callProvider({ feature, prompt: `${label}\nRecords: ${JSON.stringify(rows).slice(0, 6000)}` });
+}
+app.post('/api/feature/ai/model-health', async (req, res) => { res.json(await featureAi('models', fallbackModelHealth, 'model-health', 'Summarise model catalog health')); });
+app.post('/api/feature/ai/inference-health', async (req, res) => { res.json(await featureAi('inferences', fallbackInferenceHealth, 'inference-health', 'Summarise inference health')); });
+app.post('/api/feature/ai/agent-readiness', async (req, res) => { res.json(await featureAi('agents', fallbackAgentReadiness, 'agent-readiness', 'Assess agent readiness')); });
+
+app.get('/api/:entity/export', async (req, res) => {
+  const entity = req.params.entity;
+  const config = requireEntity(entity);
+  const format = req.query.format === 'json' ? 'json' : 'csv';
+  const { rows } = await pool.query(`SELECT * FROM "${entity}" ORDER BY created_at DESC LIMIT 1000`);
+  const hydrated = await hydrate(pool, entity, rows);
+  if (format === 'json') {
+    res.setHeader('Content-Disposition', `attachment; filename="opengradient-${entity}.json"`);
+    return res.type('application/json').send(recordsToJson(hydrated));
+  }
+  res.setHeader('Content-Disposition', `attachment; filename="opengradient-${entity}.csv"`);
+  return res.type('text/csv').send(recordsToCsv(hydrated, config.fields));
 });
 
 app.get('/api/:entity/:id', async (req, res) => {
